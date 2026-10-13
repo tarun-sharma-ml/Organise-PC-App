@@ -1,0 +1,193 @@
+"""
+The processing pipeline applied to every file event.
+
+Order matters:
+  1. Screenshot organize (Pictures/Videos only) — pulls screenshots out first
+  2. Format conversion (HEIC->JPG, MOV->MP4)
+  3. Downloads sort (by type, Downloads only)
+  4. Duplicate check (content hash)
+  5. Rename (Name_ext_date_time) — always last, so earlier steps see clean names
+"""
+
+import os
+from collections import defaultdict
+from pathlib import Path
+from utils.partial import _is_partial
+
+from config import settings
+from utils import (
+    ai_namer,
+    ai_rename_registry,
+    approval_ui,
+    archiver,
+    converter,
+    duplicates,
+    renamer,
+    screenshots,
+    sorter,
+    telegram_bot,
+)
+from utils.logger import log_action
+
+# Duplicate hashes are tracked PER FOLDER (keyed by the file's actual parent
+# directory at the time it's checked, i.e. after sorting has already moved it
+# to its destination folder). This means duplicate detection only ever compares
+# files that live side-by-side in the same folder — not across the whole
+# Downloads/Pictures/Videos tree.
+_KNOWN_HASHES = defaultdict(dict)
+
+
+def _rename_with_ai_assist(file_path: Path) -> Path:
+    """Tries an AI-suggested rename first; falls back to the standard
+    Name_ext_date convention if AI naming is off/unavailable, the file type
+    isn't supported, the API call fails, or the approval path rejects it.
+    """
+    if ai_rename_registry.is_ai_named(file_path):
+        # Already has an AI-approved name from a previous run — don't burn
+        # a Gemini request re-suggesting a name for it (wastes quota, and
+        # a non-deterministic model can return a DIFFERENT name each time,
+        # which would otherwise keep renaming this file forever on every
+        # sweep even though nothing about it actually changed).
+        return file_path
+
+    if renamer._already_renamed(file_path.stem, file_path.suffix.lstrip(".")):
+        # Already in the standard Name_ext_date convention — most commonly
+        # because a previous run's AI suggestion was declined and fell back
+        # to this format. Without this check, every future sweep (including
+        # after a restart, via run_initial_sweep) would call Gemini again,
+        # get a fresh suggestion, and re-prompt for approval on a file the
+        # user has already made a decision about — forever.
+        return file_path
+
+    suggested_stem = ai_namer.suggest_name(file_path)
+
+    if suggested_stem:
+        suggested_display_name = f"{suggested_stem}{file_path.suffix}"
+        if settings.AI_RENAME_AUTO_APPROVE:
+            log_action(
+                f"AI rename auto-approved for {file_path.name}: {suggested_display_name}"
+            )
+            return renamer.rename_file(file_path, override_stem=suggested_stem)
+
+        if settings.AI_RENAME_APPROVAL_MODE == "telegram":
+            sent = telegram_bot.request_approval(
+                file_path, suggested_stem, suggested_display_name
+            )
+            if sent:
+                # Fire-and-forget: the suggestion is now sitting in Telegram
+                # with Approve/Skip buttons. We do NOT wait for a reply and
+                # we do NOT fall back to the standard convention here — the
+                # file is left exactly as-is. The actual rename (or the
+                # decision to leave it alone) happens later, inside the
+                # Telegram callback handler, whenever the button is tapped.
+                return file_path
+            log_action(
+                f"Telegram approval unavailable for {file_path.name} — "
+                "falling back to the Windows dialog for this file."
+            )
+
+        approved = approval_ui.confirm_rename(file_path.name, suggested_display_name)
+        if approved:
+            return renamer.rename_file(file_path, override_stem=suggested_stem)
+        log_action(
+            f"AI rename declined for {file_path.name} — using standard convention"
+        )
+
+    return renamer.rename_file(file_path)
+
+
+def process_downloads_file(file_path: Path):
+    if _is_partial(file_path):
+        return
+    
+    if not file_path.exists() or not file_path.is_file():
+        return
+
+    if settings.DOWNLOADS_SORT_ENABLED:
+        file_path = sorter.sort_file(file_path)
+
+    if file_path.suffix.lower() == ".zip":
+        extracted = archiver.extract_zip_archive(file_path)
+        if extracted is None:
+            return  # extracted (or would have, under DRY_RUN) — the zip is
+            # now a folder, or gone entirely, so there's nothing left here
+            # to duplicate-check or rename.
+        file_path = extracted  # extraction disabled/failed — treat as a
+        # normal file and fall through to the rest of the pipeline below.
+
+    if settings.DUPLICATE_CHECK_ENABLED:
+        folder_key = str(file_path.parent)
+        is_dup = duplicates.check_and_flag_duplicate(
+            file_path, _KNOWN_HASHES[folder_key]
+        )
+        if is_dup:
+            return  # duplicate moved out — nothing left to rename
+
+    if settings.RENAME_ENABLED:
+        _rename_with_ai_assist(file_path)
+
+    if sorter._is_excluded(file_path):
+        return  # inside an excluded folder (e.g. Projects) — never touch
+
+
+def process_media_file(file_path: Path):
+    """Used for both Pictures and Videos folders."""
+    if _is_partial(file_path):
+        return
+    
+    if not file_path.exists() or not file_path.is_file():
+        return
+
+    if settings.SCREENSHOT_ORGANIZE_ENABLED and screenshots.is_screenshot(file_path):
+        file_path = screenshots.organize_screenshot(file_path)
+
+    ext = file_path.suffix.lower()
+    if ext == ".heic":
+        file_path = converter.convert_heic_to_jpg(file_path)
+    elif ext == ".mov":
+        file_path = converter.convert_mov_to_mp4(file_path)
+
+    if settings.DUPLICATE_CHECK_ENABLED:
+        folder_key = str(file_path.parent)
+        is_dup = duplicates.check_and_flag_duplicate(
+            file_path, _KNOWN_HASHES[folder_key]
+        )
+        if is_dup:
+            return
+
+    if settings.RENAME_ENABLED:
+        # Was previously a plain renamer.rename_file() call — meaning every
+        # photo/video in Pictures & Videos silently skipped AI naming
+        # entirely and only ever got the standard Name_ext_date convention,
+        # regardless of AI_RENAME_ENABLED. Route through the same
+        # AI-assist path Downloads uses so images actually get considered.
+        _rename_with_ai_assist(file_path)
+
+
+def run_initial_sweep():
+    """One pass over existing files in all 3 folders at startup, using the same pipeline.
+    Downloads is walked manually (not Path.rglob) so excluded folders (e.g. Projects) are
+    pruned from the walk entirely and never descended into — not just skipped per-file.
+    """
+    if settings.DOWNLOADS_FOLDER.exists():
+        downloads_files = []
+        for root, dirnames, filenames in os.walk(settings.DOWNLOADS_FOLDER):
+            root_path = Path(root)
+            dirnames[:] = [
+                d for d in dirnames if not sorter._is_excluded(root_path / d)
+            ]
+            for name in sorted(filenames):
+                downloads_files.append(root_path / name)
+
+        for f in downloads_files:
+            process_downloads_file(f)
+
+    if settings.PICTURES_FOLDER.exists():
+        for f in sorted(settings.PICTURES_FOLDER.rglob("*")):
+            if f.is_file():
+                process_media_file(f)
+
+    if settings.VIDEOS_FOLDER.exists():
+        for f in sorted(settings.VIDEOS_FOLDER.rglob("*")):
+            if f.is_file():
+                process_media_file(f)
